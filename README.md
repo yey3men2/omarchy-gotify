@@ -64,7 +64,8 @@ messages. New messages are checked every 15 seconds.
   `X-Gotify-Key` request header. They are not placed in process arguments or
   URLs.
 - Message action links are restricted to HTTP and HTTPS URLs.
-- The plugin runs entirely as the current user and never invokes `sudo`.
+- The plugin runs entirely as the current user and does not request elevated
+  privileges.
 - Message text and application metadata are requested directly from the Gotify
   server configured by the user.
 
