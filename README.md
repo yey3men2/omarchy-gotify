@@ -6,7 +6,7 @@ scrollable, searchable panel.
 
 ## Features
 
-- Native desktop notifications with priority-aware urgency
+- Native desktop notifications with channel icons and priority-aware urgency
 - Unread badge and connection-status indicator, both optional
 - Searchable filtering across every application configured in Gotify
 - Application logos, readable message previews, and relative timestamps

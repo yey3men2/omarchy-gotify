@@ -7,9 +7,10 @@ state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-gotify"
 config_file="$config_dir/config.json"
 state_file="$state_dir/state.json"
 lock_file="$state_dir/poll.lock"
+icon_dir="$state_dir/icons"
 
-mkdir -p "$config_dir" "$state_dir"
-chmod 700 "$config_dir" "$state_dir"
+mkdir -p "$config_dir" "$state_dir" "$icon_dir"
+chmod 700 "$config_dir" "$state_dir" "$icon_dir"
 
 read_config() {
   [[ -s $config_file ]] || return 1
@@ -50,18 +51,44 @@ write_state() {
   mv "$tmp" "$state_file"
 }
 
+application_icon() {
+  local app_id=$1 applications=$2 image icon_path tmp
+  image=$(jq -r --argjson appId "$app_id" \
+    '.[]? | select(.id == $appId) | .image // empty' <<<"$applications" | head -n 1)
+  [[ -n $image && $image != /* && $image != *[[:space:]]* ]] || return 1
+
+  icon_path="$icon_dir/$app_id"
+  if [[ ! -s $icon_path ]]; then
+    tmp=$(mktemp "$icon_dir/.icon.XXXXXX")
+    if ! curl_authenticated "$token" --fail --silent --show-error --max-time 12 \
+      --max-filesize 2097152 --remove-on-error --output "$tmp" "$server/$image" || [[ ! -s $tmp ]]; then
+      return 1
+    fi
+    chmod 600 "$tmp"
+    mv "$tmp" "$icon_path"
+  fi
+  printf '%s\n' "$icon_path"
+}
+
 notify_message() {
-  local item=$1 title body priority click_url urgency
+  local item=$1 applications=$2 title body priority click_url urgency app_id app_icon
   title=$(jq -r '.title // "Gotify"' <<<"$item")
   body=$(jq -r '.message // ""' <<<"$item")
   priority=$(jq -r '.priority // 0' <<<"$item")
+  app_id=$(jq -r '.appid // 0' <<<"$item")
   click_url=$(jq -r '.extras["client::notification.click"].url // empty' <<<"$item")
   [[ $click_url =~ ^https?://[^[:space:]]+$ ]] || click_url="$server"
   urgency=normal
   (( priority >= 8 )) && urgency=critical
   (( priority <= 1 )) && urgency=low
-  omarchy-notification-send --app-name Gotify -g "󰊪" -u "$urgency" \
-    "$title" "$body" --exec xdg-open "$click_url"
+  app_icon=$(application_icon "$app_id" "$applications" 2>/dev/null || true)
+  if [[ -n $app_icon ]]; then
+    omarchy-notification-send --app-name Gotify -i "$app_icon" -u "$urgency" \
+      "$title" "$body" --exec xdg-open "$click_url"
+  else
+    omarchy-notification-send --app-name Gotify -g "󰊪" -u "$urgency" \
+      "$title" "$body" --exec xdg-open "$click_url"
+  fi
 }
 
 poll() {
@@ -69,7 +96,7 @@ poll() {
   exec 9>"$lock_file"
   flock -n 9 || exit 0
 
-  local last_id=0 unread=0 payload error max_id new_count initialized=false
+  local last_id=0 unread=0 payload applications error max_id new_count initialized=false
   if [[ -s $state_file ]]; then
     last_id=$(jq -r '.lastId // 0' "$state_file" 2>/dev/null || echo 0)
     unread=$(jq -r '.unread // 0' "$state_file" 2>/dev/null || echo 0)
@@ -91,8 +118,10 @@ poll() {
     exit 0
   fi
 
+  applications=$(api_applications 2>/dev/null || echo '[]')
+
   while IFS= read -r item; do
-    [[ -n $item ]] && notify_message "$item"
+    [[ -n $item ]] && notify_message "$item" "$applications"
   done < <(jq -c --argjson last "$last_id" '[.messages[]? | select(.id > $last)] | sort_by(.id)[]' <<<"$payload")
 
   new_count=$(jq --argjson last "$last_id" '[.messages[]? | select(.id > $last)] | length' <<<"$payload")
