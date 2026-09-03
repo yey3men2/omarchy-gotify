@@ -1,0 +1,327 @@
+#!/bin/bash
+
+set -euo pipefail
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/gotify"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-gotify"
+config_file="$config_dir/config.json"
+state_file="$state_dir/state.json"
+lock_file="$state_dir/poll.lock"
+
+mkdir -p "$config_dir" "$state_dir"
+chmod 700 "$config_dir" "$state_dir"
+
+read_config() {
+  [[ -s $config_file ]] || return 1
+  server=$(jq -er '.server | select(type == "string" and length > 0)' "$config_file") || return 1
+  token=$(jq -er '.token | select(type == "string" and length > 0)' "$config_file") || return 1
+  server=${server%/}
+  show_connection_indicator=$(jq -r 'if has("showConnectionIndicator") then .showConnectionIndicator else true end' "$config_file" 2>/dev/null || echo true)
+  show_unread_indicator=$(jq -r 'if has("showUnreadIndicator") then .showUnreadIndicator else true end' "$config_file" 2>/dev/null || echo true)
+}
+
+curl_authenticated() {
+  local auth_token=$1
+  shift
+  printf 'X-Gotify-Key: %s\n' "$auth_token" | curl --header @- "$@"
+}
+
+api_messages() {
+  local since=${1:-0}
+  curl_authenticated "$token" --fail --silent --show-error --max-time 12 --get \
+    --data-urlencode "limit=100" \
+    --data-urlencode "since=$since" \
+    "$server/message"
+}
+
+api_applications() {
+  curl_authenticated "$token" --fail --silent --show-error --max-time 12 --get \
+    "$server/application"
+}
+
+write_state() {
+  local last_id=$1 online=$2 error=${3:-} unread=${4:-0}
+  local tmp
+  tmp=$(mktemp "$state_dir/.state.XXXXXX")
+  jq -n --argjson lastId "$last_id" --argjson online "$online" --argjson unread "$unread" \
+    --arg checkedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg error "$error" \
+    '{lastId:$lastId,online:$online,unread:$unread,checkedAt:$checkedAt,error:$error}' >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$state_file"
+}
+
+notify_message() {
+  local item=$1 title body priority click_url urgency
+  title=$(jq -r '.title // "Gotify"' <<<"$item")
+  body=$(jq -r '.message // ""' <<<"$item")
+  priority=$(jq -r '.priority // 0' <<<"$item")
+  click_url=$(jq -r '.extras["client::notification.click"].url // empty' <<<"$item")
+  [[ $click_url =~ ^https?://[^[:space:]]+$ ]] || click_url="$server"
+  urgency=normal
+  (( priority >= 8 )) && urgency=critical
+  (( priority <= 1 )) && urgency=low
+  omarchy-notification-send --app-name Gotify -g "󰊪" -u "$urgency" \
+    "$title" "$body" --exec xdg-open "$click_url"
+}
+
+poll() {
+  read_config || exit 0
+  exec 9>"$lock_file"
+  flock -n 9 || exit 0
+
+  local last_id=0 unread=0 payload error max_id new_count initialized=false
+  if [[ -s $state_file ]]; then
+    last_id=$(jq -r '.lastId // 0' "$state_file" 2>/dev/null || echo 0)
+    unread=$(jq -r '.unread // 0' "$state_file" 2>/dev/null || echo 0)
+  else
+    initialized=true
+  fi
+
+  # Gotify's `since` value is a backward-pagination cursor (IDs below it),
+  # not a lower bound. Fetch the newest page and filter IDs locally.
+  if ! payload=$(api_messages 0 2>&1); then
+    error=$(tail -n 1 <<<"$payload")
+    write_state "$last_id" false "$error" "$unread"
+    exit 0
+  fi
+
+  max_id=$(jq '[.messages[]?.id // 0] | max // 0' <<<"$payload")
+  if [[ $initialized == true ]]; then
+    write_state "$max_id" true "" 0
+    exit 0
+  fi
+
+  while IFS= read -r item; do
+    [[ -n $item ]] && notify_message "$item"
+  done < <(jq -c --argjson last "$last_id" '[.messages[]? | select(.id > $last)] | sort_by(.id)[]' <<<"$payload")
+
+  new_count=$(jq --argjson last "$last_id" '[.messages[]? | select(.id > $last)] | length' <<<"$payload")
+  unread=$((unread + new_count))
+
+  (( max_id < last_id )) && max_id=$last_id
+  write_state "$max_id" true "" "$unread"
+}
+
+messages() {
+  if ! read_config; then
+    jq -n '{configured:false,messages:[]}'
+    return
+  fi
+  local payload applications
+  if ! payload=$(api_messages 0); then
+    jq -n '{configured:true,messages:[]}'
+    return
+  fi
+  applications=$(api_applications 2>/dev/null || echo '[]')
+  jq -n --arg server "$server" \
+    --slurpfile payload <(printf '%s\n' "$payload") \
+    --slurpfile applications <(printf '%s\n' "$applications") '
+    ($applications[0] | map({key:(.id|tostring), value:.}) | from_entries) as $apps |
+    {configured:true,
+     applications:[$applications[0][]? | {id, name:(.name // ("App " + (.id|tostring))),
+       description:(.description // ""),
+       iconUrl:(if (.image // "") == "" then "" else ($server + "/" + .image) end)}]
+       | sort_by(.name),
+     messages:[$payload[0].messages[]? |
+      ($apps[(.appid|tostring)] // {}) as $app | {
+        id, appId:.appid, appName:($app.name // ("App " + (.appid|tostring))),
+        iconUrl:(if ($app.image // "") == "" then "" else ($server + "/" + $app.image) end),
+        title:(.title // "Gotify"), message:(.message // ""),
+        date:(.date // ""), priority:(.priority // 0),
+        clickUrl:(.extras["client::notification.click"].url // $server)
+      }] | sort_by(.id) | reverse}'
+}
+
+mark_read() {
+  read_config || exit 0
+  exec 9>"$lock_file"
+  flock 9
+  local last_id=0 online=true error=""
+  if [[ -s $state_file ]]; then
+    last_id=$(jq -r '.lastId // 0' "$state_file" 2>/dev/null || echo 0)
+    online=$(jq -r '.online // true' "$state_file" 2>/dev/null || echo true)
+    error=$(jq -r '.error // ""' "$state_file" 2>/dev/null || true)
+  fi
+  write_state "$last_id" "$online" "$error" 0
+}
+
+open_message() {
+  local wanted=${1:-}
+  read_config || exit 1
+  [[ $wanted =~ ^[0-9]+$ ]] || exit 2
+  local payload click_url
+  payload=$(api_messages 0)
+  click_url=$(jq -r --argjson wanted "$wanted" --arg server "$server" \
+    '.messages[]? | select(.id == $wanted) | .extras["client::notification.click"].url // $server' \
+    <<<"$payload" | head -n 1)
+  [[ $click_url =~ ^https?://[^[:space:]]+$ ]] || click_url="$server"
+  xdg-open "$click_url" >/dev/null 2>&1 &
+}
+
+status() {
+  if ! read_config; then
+    jq -n '{configured:false,online:false,message:"Gotify not configured"}'
+    return
+  fi
+  local online=false checked="Never" error="" unread=0
+  if [[ -s $state_file ]]; then
+    online=$(jq -r '.online // false' "$state_file" 2>/dev/null || echo false)
+    checked=$(jq -r '.checkedAt // "Never"' "$state_file" 2>/dev/null || echo Never)
+    error=$(jq -r '.error // ""' "$state_file" 2>/dev/null || true)
+    unread=$(jq -r '.unread // 0' "$state_file" 2>/dev/null || echo 0)
+  fi
+  if [[ $online == true ]]; then
+    jq -n --arg checked "$checked" --argjson unread "$unread" \
+      --argjson showConnectionIndicator "$show_connection_indicator" \
+      --argjson showUnreadIndicator "$show_unread_indicator" \
+      '{configured:true,online:true,unread:$unread,showConnectionIndicator:$showConnectionIndicator,
+        showUnreadIndicator:$showUnreadIndicator,message:("Gotify connected · " + $checked)}'
+  else
+    jq -n --arg error "$error" --argjson unread "$unread" \
+      --argjson showConnectionIndicator "$show_connection_indicator" \
+      --argjson showUnreadIndicator "$show_unread_indicator" \
+      '{configured:true,online:false,unread:$unread,showConnectionIndicator:$showConnectionIndicator,
+        showUnreadIndicator:$showUnreadIndicator,message:(if $error == "" then "Gotify waiting for connection" else "Gotify: " + $error end)}'
+  fi
+}
+
+setup() {
+  local server_input token_input response tmp
+  clear
+  printf 'Gotify for Omarchy setup\n\n'
+  printf 'Create a CLIENT token in Gotify first (not an application token).\n\n'
+  read -r -p "Server URL (for example, https://gotify.example.com): " server_input
+  server_input=${server_input%/}
+  [[ $server_input =~ ^https?://[^[:space:]]+$ ]] || { printf 'Enter a valid HTTP or HTTPS URL.\n'; read -r -p 'Press Enter to close…'; exit 1; }
+  read -r -s -p 'Client token: ' token_input
+  printf '\nTesting connection…\n'
+  [[ -n $token_input ]] || { printf 'Token cannot be empty.\n'; read -r -p 'Press Enter to close…'; exit 1; }
+  [[ $token_input != *$'\n'* && $token_input != *$'\r'* ]] || { printf 'Token contains invalid characters.\n'; read -r -p 'Press Enter to close…'; exit 1; }
+  if ! response=$(curl_authenticated "$token_input" --fail --silent --show-error --max-time 15 --get \
+      --data-urlencode "limit=1" "$server_input/message" 2>&1); then
+    printf 'Connection failed: %s\n' "$response"
+    read -r -p 'Press Enter to close…'
+    exit 1
+  fi
+  jq -e '.messages' >/dev/null <<<"$response" || { printf 'Unexpected response from server.\n'; read -r -p 'Press Enter to close…'; exit 1; }
+  tmp=$(mktemp "$config_dir/.config.XXXXXX")
+  jq -n --arg server "$server_input" --arg token "$token_input" \
+    '{server:$server,token:$token,showConnectionIndicator:true,showUnreadIndicator:true}' >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$config_file"
+  write_state "$(jq '[.messages[]?.id // 0] | max // 0' <<<"$response")" true "" 0
+  printf '\nConnected. New Gotify messages will appear as Omarchy notifications.\n'
+  read -r -p 'Press Enter to close…'
+}
+
+open_gotify() {
+  if read_config; then xdg-open "$server" >/dev/null 2>&1 &
+  else setup
+  fi
+}
+
+show_config() {
+  if read_config; then
+    jq -n --arg server "$server" \
+      --argjson showConnectionIndicator "$show_connection_indicator" \
+      --argjson showUnreadIndicator "$show_unread_indicator" \
+      '{configured:true,server:$server,hasToken:true,showConnectionIndicator:$showConnectionIndicator,
+        showUnreadIndicator:$showUnreadIndicator}'
+  else
+    jq -n '{configured:false,server:"",hasToken:false,showConnectionIndicator:true,showUnreadIndicator:true}'
+  fi
+}
+
+configure() {
+  local input server_input token_input existing_token="" response tmp
+  local existing_connection=true existing_unread=true connection_input unread_input
+  IFS= read -r input || input=""
+  if ! server_input=$(jq -er '.server | select(type == "string" and length > 0)' <<<"$input" 2>/dev/null); then
+    jq -n '{ok:false,message:"Enter a Gotify server URL."}'
+    return 1
+  fi
+  token_input=$(jq -r '.token // ""' <<<"$input" 2>/dev/null || true)
+  server_input=${server_input%/}
+  if [[ ! $server_input =~ ^https?://[^[:space:]]+$ ]]; then
+    jq -n '{ok:false,message:"Enter a valid HTTP or HTTPS Gotify URL."}'
+    return 1
+  fi
+  if [[ -s $config_file ]]; then
+    existing_token=$(jq -r '.token // ""' "$config_file" 2>/dev/null || true)
+    existing_connection=$(jq -r 'if has("showConnectionIndicator") then .showConnectionIndicator else true end' "$config_file" 2>/dev/null || echo true)
+    existing_unread=$(jq -r 'if has("showUnreadIndicator") then .showUnreadIndicator else true end' "$config_file" 2>/dev/null || echo true)
+  fi
+  connection_input=$(jq -r --argjson fallback "$existing_connection" 'if has("showConnectionIndicator") then .showConnectionIndicator else $fallback end' <<<"$input")
+  unread_input=$(jq -r --argjson fallback "$existing_unread" 'if has("showUnreadIndicator") then .showUnreadIndicator else $fallback end' <<<"$input")
+  [[ -n $token_input ]] || token_input=$existing_token
+  if [[ -z $token_input ]]; then
+    jq -n '{ok:false,message:"Enter a Gotify client token."}'
+    return 1
+  fi
+  if [[ $token_input == *$'\n'* || $token_input == *$'\r'* ]]; then
+    jq -n '{ok:false,message:"The client token contains invalid characters."}'
+    return 1
+  fi
+  if ! response=$(curl_authenticated "$token_input" --fail --silent --show-error --max-time 15 --get \
+      --data-urlencode "limit=1" \
+      "$server_input/message" 2>&1); then
+    jq -n --arg message "Connection failed: $response" '{ok:false,message:$message}'
+    return 1
+  fi
+  if ! jq -e '.messages' >/dev/null <<<"$response"; then
+    jq -n '{ok:false,message:"The server returned an unexpected response."}'
+    return 1
+  fi
+  tmp=$(mktemp "$config_dir/.config.XXXXXX")
+  jq -n --arg server "$server_input" --arg token "$token_input" \
+    --argjson showConnectionIndicator "$connection_input" --argjson showUnreadIndicator "$unread_input" \
+    '{server:$server,token:$token,showConnectionIndicator:$showConnectionIndicator,
+      showUnreadIndicator:$showUnreadIndicator}' >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$config_file"
+  local newest
+  newest=$(jq '[.messages[]?.id // 0] | max // 0' <<<"$response")
+  write_state "$newest" true "" 0
+  jq -n --arg server "$server_input" '{ok:true,server:$server,message:"Connected successfully."}'
+}
+
+save_preferences() {
+  local input connection_input unread_input tmp
+  read_config || {
+    jq -n '{ok:false,message:"Configure Gotify before changing preferences."}'
+    return 1
+  }
+  IFS= read -r input || input=""
+  connection_input=$(jq -er 'if (.showConnectionIndicator | type) == "boolean" then
+      (.showConnectionIndicator | tostring) else error("invalid") end' <<<"$input" 2>/dev/null) || {
+    jq -n '{ok:false,message:"Invalid connection-indicator setting."}'
+    return 1
+  }
+  unread_input=$(jq -er 'if (.showUnreadIndicator | type) == "boolean" then
+      (.showUnreadIndicator | tostring) else error("invalid") end' <<<"$input" 2>/dev/null) || {
+    jq -n '{ok:false,message:"Invalid unread-indicator setting."}'
+    return 1
+  }
+  tmp=$(mktemp "$config_dir/.config.XXXXXX")
+  jq -n --arg server "$server" --arg token "$token" \
+    --argjson showConnectionIndicator "$connection_input" --argjson showUnreadIndicator "$unread_input" \
+    '{server:$server,token:$token,showConnectionIndicator:$showConnectionIndicator,
+      showUnreadIndicator:$showUnreadIndicator}' >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$config_file"
+  jq -n '{ok:true,message:"Indicator preferences saved."}'
+}
+
+case ${1:-status} in
+  poll) poll ;;
+  status) status ;;
+  messages) messages ;;
+  mark-read) mark_read ;;
+  open-message) open_message "${2:-}" ;;
+  show-config) show_config ;;
+  configure) configure ;;
+  save-preferences) save_preferences ;;
+  setup) setup ;;
+  open) open_gotify ;;
+  *) echo "Usage: ${0##*/} {poll|status|messages|mark-read|open-message ID|show-config|configure|save-preferences|setup|open}" >&2; exit 2 ;;
+esac

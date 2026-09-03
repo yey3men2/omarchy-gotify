@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "yey3men2.gotify",
+  "name": "Gotify",
+  "version": "1.0.0",
+  "author": "Gerson De La Cruz",
+  "license": "MIT",
+  "description": "Receive Gotify messages and browse notification history from the Omarchy bar.",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Gotify",
+    "description": "Gotify connection status and message delivery",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
