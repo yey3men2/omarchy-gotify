@@ -7,8 +7,11 @@ scrollable, searchable panel.
 ## Features
 
 - Native desktop notifications with channel icons and priority-aware urgency
+- Catch-up summaries after lock, sleep, or connection gaps instead of notification storms
+- A master desktop-notification switch that leaves polling and inbox history active
 - Unread badge and connection-status indicator, both optional
 - Searchable filtering across every application configured in Gotify
+- Configurable message-history size with paginated offline catch-up
 - Application logos, readable message previews, and relative timestamps
 - Click-through to safe HTTP(S) links supplied by Gotify messages
 - In-panel server and client-token configuration
@@ -39,11 +42,31 @@ an application token will not work.
 - Click a message to open its HTTP(S) action URL, or the Gotify server when no
   safe action URL is present.
 - Middle-click the bar icon to request an immediate refresh.
-- Use the gear to update the connection or indicator preferences.
+- Use the gear to update the connection, notification, and indicator preferences.
+
+Desktop notifications are enabled by default. When catch-up summaries are
+enabled, more than five queued messages—or multiple messages following a gap of
+more than 90 seconds or while the session was locked—produce one summary
+notification. Up to two critical
+messages can still appear individually. The individual-message limit is
+configurable from 1 to 20.
+
+The inbox history size can be set to 25, 50, 100, 200, or 500 and defaults to
+100. Offline and locked-session catch-up follows Gotify's pagination until it
+reaches the last processed message, independently of the inbox history size.
 
 The first successful connection establishes a baseline, so existing messages
-are not replayed as desktop popups. The inbox still shows the latest 100
-messages. New messages are checked every 15 seconds.
+are not replayed as desktop popups. Disabling desktop notifications does not
+stop polling, history collection, unread counts, or the connection indicator.
+New messages are checked every 15 seconds.
+
+## Testing
+
+Run the isolated bridge regression suite with:
+
+```sh
+tests/test-gotify-bridge
+```
 
 ## Preview
 

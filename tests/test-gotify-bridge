@@ -1,0 +1,107 @@
+#!/bin/bash
+
+set -euo pipefail
+
+plugin_dir=$(cd "$(dirname "$0")/.." && pwd)
+bridge="$plugin_dir/bin/gotify-bridge"
+test_root=$(mktemp -d)
+trap 'rm -rf "$test_root"' EXIT
+
+export XDG_CONFIG_HOME="$test_root/config"
+export XDG_STATE_HOME="$test_root/state"
+export TEST_LOG="$test_root/notifications.log"
+export TEST_SCENARIO=initial
+export GOTIFY_LOCK_STATE=false
+mock_bin="$test_root/bin"
+mkdir -p "$mock_bin" "$XDG_CONFIG_HOME/omarchy/gotify"
+
+cat >"$XDG_CONFIG_HOME/omarchy/gotify/config.json" <<'JSON'
+{"server":"https://gotify.test","token":"secret","notificationsEnabled":true,
+ "catchUpEnabled":true,"maxIndividualNotifications":5,"messageFetchLimit":25}
+JSON
+chmod 600 "$XDG_CONFIG_HOME/omarchy/gotify/config.json"
+
+cat >"$mock_bin/curl" <<'MOCK'
+#!/bin/bash
+args="$*"
+if [[ $args == *'/application'* ]]; then
+  printf '[]\n'
+  exit 0
+fi
+since=0
+previous=""
+for arg in "$@"; do
+  [[ $previous == --data-urlencode && $arg == since=* ]] && since=${arg#since=}
+  previous=$arg
+done
+case ${TEST_SCENARIO:-initial}:$since in
+  initial:0) printf '%s\n' '{"messages":[{"id":2,"appid":1},{"id":1,"appid":1}],"paging":{"since":1}}' ;;
+  locked:0|unlock:0) printf '%s\n' '{"messages":[{"id":4,"appid":1},{"id":3,"appid":1},{"id":2,"appid":1}],"paging":{"since":2}}' ;;
+  pagination:0) printf '%s\n' '{"messages":[{"id":4,"appid":1},{"id":3,"appid":1}],"paging":{"since":3}}' ;;
+  pagination:3) printf '%s\n' '{"messages":[{"id":2,"appid":1},{"id":1,"appid":1}],"paging":{"since":1}}' ;;
+  silent:0) printf '%s\n' '{"messages":[{"id":5,"appid":1},{"id":4,"appid":1}],"paging":{"since":4}}' ;;
+  *) printf '%s\n' '{"messages":[],"paging":{"since":0}}' ;;
+esac
+MOCK
+
+cat >"$mock_bin/omarchy-notification-send" <<'MOCK'
+#!/bin/bash
+printf '%q ' "$@" >>"$TEST_LOG"
+printf '\n' >>"$TEST_LOG"
+MOCK
+
+cat >"$mock_bin/logger" <<'MOCK'
+#!/bin/bash
+exit 0
+MOCK
+
+chmod +x "$mock_bin/curl" "$mock_bin/omarchy-notification-send" "$mock_bin/logger"
+export PATH="$mock_bin:$PATH"
+
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+assert_json() {
+  local file=$1 expression=$2 message=$3
+  jq -e "$expression" "$file" >/dev/null || fail "$message"
+}
+
+# First run establishes a baseline and never replays existing messages.
+"$bridge" poll
+state="$XDG_STATE_HOME/omarchy-gotify/state.json"
+assert_json "$state" '.lastId == 2 and .unread == 0 and .locked == false' 'initial baseline'
+[[ ! -s $TEST_LOG ]] || fail 'first run emitted a notification'
+
+# Locked polling keeps pending messages unconsumed and avoids duplicate unread counts.
+export TEST_SCENARIO=locked GOTIFY_LOCK_STATE=true
+"$bridge" poll
+"$bridge" poll
+assert_json "$state" '.lastId == 2 and .unread == 0 and .locked == true' 'locked state retention'
+[[ ! -s $TEST_LOG ]] || fail 'locked poll emitted a notification'
+
+# Unlock summarizes the retained batch exactly once.
+export TEST_SCENARIO=unlock GOTIFY_LOCK_STATE=false
+"$bridge" poll
+assert_json "$state" '.lastId == 4 and .unread == 2 and .locked == false' 'unlock processing'
+[[ $(wc -l <"$TEST_LOG") -eq 1 ]] || fail 'unlock did not emit one summary'
+rg -q '2\\ Gotify\\ messages\\ received\\ while\\ away' "$TEST_LOG" || fail 'summary title missing'
+
+# Backward pagination reaches the prior processed ID and delivers every new item.
+: >"$TEST_LOG"
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+jq -n --arg now "$now" '{lastId:1,online:true,unread:0,checkedAt:$now,lastSuccessAt:$now,error:"",locked:false}' >"$state"
+export TEST_SCENARIO=pagination
+"$bridge" poll
+assert_json "$state" '.lastId == 4 and .unread == 3' 'paginated backlog processing'
+[[ $(wc -l <"$TEST_LOG") -eq 3 ]] || fail 'pagination did not emit all three messages'
+
+# Disabling popups still advances history and unread state without notifying.
+: >"$TEST_LOG"
+config_tmp="$XDG_CONFIG_HOME/omarchy/gotify/config.tmp"
+jq '.notificationsEnabled = false' "$XDG_CONFIG_HOME/omarchy/gotify/config.json" >"$config_tmp"
+mv "$config_tmp" "$XDG_CONFIG_HOME/omarchy/gotify/config.json"
+chmod 600 "$XDG_CONFIG_HOME/omarchy/gotify/config.json"
+export TEST_SCENARIO=silent
+"$bridge" poll
+assert_json "$state" '.lastId == 5 and .unread == 4' 'notification-disabled processing'
+[[ ! -s $TEST_LOG ]] || fail 'disabled notifications emitted a popup'
+
+printf 'PASS: gotify bridge regression tests\n'
