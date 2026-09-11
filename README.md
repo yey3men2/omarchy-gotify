@@ -45,11 +45,12 @@ an application token will not work.
 - Use the gear to update the connection, notification, and indicator preferences.
 
 Desktop notifications are enabled by default. When catch-up summaries are
-enabled, more than five queued messages—or multiple messages following a gap of
-more than 90 seconds or while the session was locked—produce one summary
-notification. Up to two critical
-messages can still appear individually. The individual-message limit is
-configurable from 1 to 20.
+enabled, multiple messages accumulated while the session was locked produce one
+summary. After a sleep or connection gap longer than 90 seconds, a summary is
+used when the queued messages exceed the configured individual-message limit.
+Messages received normally while the session is active remain individual. Up
+to two critical catch-up messages can still appear individually. The limit is
+configurable from 1 to 20 and defaults to five.
 
 The inbox history size can be set to 25, 50, 100, 200, or 500 and defaults to
 100. Offline and locked-session catch-up follows Gotify's pagination until it

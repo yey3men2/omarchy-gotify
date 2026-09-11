@@ -589,7 +589,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Maximum individual notifications (1–20)"
+            text: "Maximum notifications after a connection gap (1–20)"
             color: root.bar ? root.bar.foreground : Color.foreground
             opacity: notificationsToggle.checked && catchUpToggle.checked ? 1.0 : 0.5
             font.family: root.bar ? root.bar.fontFamily : Style.font.family

@@ -40,6 +40,7 @@ case ${TEST_SCENARIO:-initial}:$since in
   pagination:0) printf '%s\n' '{"messages":[{"id":4,"appid":1},{"id":3,"appid":1}],"paging":{"since":3}}' ;;
   pagination:3) printf '%s\n' '{"messages":[{"id":2,"appid":1},{"id":1,"appid":1}],"paging":{"since":1}}' ;;
   silent:0) printf '%s\n' '{"messages":[{"id":5,"appid":1},{"id":4,"appid":1}],"paging":{"since":4}}' ;;
+  activeburst:0) printf '%s\n' '{"messages":[{"id":10,"appid":1},{"id":9,"appid":1},{"id":8,"appid":1},{"id":7,"appid":1},{"id":6,"appid":1},{"id":5,"appid":1},{"id":4,"appid":1}],"paging":{"since":4}}' ;;
   *) printf '%s\n' '{"messages":[],"paging":{"since":0}}' ;;
 esac
 MOCK
@@ -103,5 +104,17 @@ export TEST_SCENARIO=silent
 "$bridge" poll
 assert_json "$state" '.lastId == 5 and .unread == 4' 'notification-disabled processing'
 [[ ! -s $TEST_LOG ]] || fail 'disabled notifications emitted a popup'
+
+# A large burst during an active session remains individual, not catch-up.
+: >"$TEST_LOG"
+jq '.notificationsEnabled = true' "$XDG_CONFIG_HOME/omarchy/gotify/config.json" >"$config_tmp"
+mv "$config_tmp" "$XDG_CONFIG_HOME/omarchy/gotify/config.json"
+chmod 600 "$XDG_CONFIG_HOME/omarchy/gotify/config.json"
+jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{lastId:4,online:true,unread:0,checkedAt:$now,lastSuccessAt:$now,error:"",locked:false}' >"$state"
+export TEST_SCENARIO=activeburst
+"$bridge" poll
+assert_json "$state" '.lastId == 10 and .unread == 6' 'active burst processing'
+[[ $(wc -l <"$TEST_LOG") -eq 6 ]] || fail 'active burst was summarized'
 
 printf 'PASS: gotify bridge regression tests\n'

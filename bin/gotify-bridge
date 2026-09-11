@@ -260,7 +260,7 @@ poll() {
     fi
     if [[ $catch_up_enabled == true ]]; then
       if [[ $was_locked == true && $new_count -gt 1 ]] || \
-          (( (gap_seconds > catch_up_after_seconds && new_count > 1) ||
+          (( gap_seconds > catch_up_after_seconds &&
              new_count > max_individual_notifications )); then
         catch_up=true
       fi
