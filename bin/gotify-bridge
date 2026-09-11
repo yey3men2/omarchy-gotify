@@ -8,6 +8,11 @@ config_file="$config_dir/config.json"
 state_file="$state_dir/state.json"
 lock_file="$state_dir/poll.lock"
 icon_dir="$state_dir/icons"
+plugin_dir=$(cd "$(dirname "$0")/.." && pwd)
+catch_up_after_seconds=90
+max_critical_catch_up=2
+backlog_page_size=100
+backlog_max_pages=100
 
 mkdir -p "$config_dir" "$state_dir" "$icon_dir"
 chmod 700 "$config_dir" "$state_dir" "$icon_dir"
@@ -19,6 +24,16 @@ read_config() {
   server=${server%/}
   show_connection_indicator=$(jq -r 'if has("showConnectionIndicator") then .showConnectionIndicator else true end' "$config_file" 2>/dev/null || echo true)
   show_unread_indicator=$(jq -r 'if has("showUnreadIndicator") then .showUnreadIndicator else true end' "$config_file" 2>/dev/null || echo true)
+  notifications_enabled=$(jq -r 'if has("notificationsEnabled") then .notificationsEnabled else true end' "$config_file" 2>/dev/null || echo true)
+  catch_up_enabled=$(jq -r 'if has("catchUpEnabled") then .catchUpEnabled else true end' "$config_file" 2>/dev/null || echo true)
+  max_individual_notifications=$(jq -r 'if has("maxIndividualNotifications") then .maxIndividualNotifications else 5 end' "$config_file" 2>/dev/null || echo 5)
+  [[ $max_individual_notifications =~ ^[0-9]+$ ]] || max_individual_notifications=5
+  (( max_individual_notifications >= 1 && max_individual_notifications <= 20 )) || max_individual_notifications=5
+  message_fetch_limit=$(jq -r 'if has("messageFetchLimit") then .messageFetchLimit else 100 end' "$config_file" 2>/dev/null || echo 100)
+  case $message_fetch_limit in
+    25|50|100|200|500) ;;
+    *) message_fetch_limit=100 ;;
+  esac
 }
 
 curl_authenticated() {
@@ -27,12 +42,70 @@ curl_authenticated() {
   printf 'X-Gotify-Key: %s\n' "$auth_token" | curl --header @- "$@"
 }
 
-api_messages() {
-  local since=${1:-0}
+api_message_page() {
+  local since=${1:-0} limit=${2:-100}
   curl_authenticated "$token" --fail --silent --show-error --max-time 12 --get \
-    --data-urlencode "limit=100" \
+    --data-urlencode "limit=$limit" \
     --data-urlencode "since=$since" \
     "$server/message"
+}
+
+api_messages() {
+  local target=$message_fetch_limit cursor=0 page page_count=0 count=0 next_cursor request_limit
+  local collected_file
+  collected_file=$(mktemp "$state_dir/.messages.XXXXXX")
+  chmod 600 "$collected_file"
+  while (( count < target )); do
+    request_limit=$((target - count))
+    (( request_limit > backlog_page_size )) && request_limit=$backlog_page_size
+    page=$(api_message_page "$cursor" "$request_limit") || { rm -f "$collected_file"; return 1; }
+    jq -c '.messages[]?' <<<"$page" >>"$collected_file"
+    count=$(wc -l <"$collected_file")
+    next_cursor=$(jq -r '.paging.since // 0' <<<"$page")
+    [[ $next_cursor =~ ^[0-9]+$ ]] || { rm -f "$collected_file"; return 1; }
+    (( next_cursor > 0 && next_cursor != cursor )) || break
+    cursor=$next_cursor
+    ((page_count += 1))
+    (( page_count <= 5 )) || { rm -f "$collected_file"; return 1; }
+  done
+  jq -sc --argjson target "$target" \
+    '{messages:(unique_by(.id) | sort_by(.id) | reverse | .[:$target])}' "$collected_file"
+  rm -f "$collected_file"
+}
+
+# Gotify's `since` parameter walks backward through older messages. Polling must
+# therefore collect pages until it reaches the last processed ID; otherwise a
+# backlog larger than the inbox display limit would be silently skipped.
+api_messages_since() {
+  local last_id=$1 cursor=0 page page_count=0 page_size next_cursor
+  local collected_file
+  collected_file=$(mktemp "$state_dir/.backlog.XXXXXX")
+  chmod 600 "$collected_file"
+
+  while (( page_count < backlog_max_pages )); do
+    page=$(api_message_page "$cursor" "$backlog_page_size") || { rm -f "$collected_file"; return 1; }
+    page_size=$(jq '.messages | length' <<<"$page")
+    (( page_size > 0 )) || break
+    jq -c '.messages[]?' <<<"$page" >>"$collected_file"
+
+    if jq -e --argjson last "$last_id" 'any(.messages[]?; .id <= $last)' <<<"$page" >/dev/null; then
+      break
+    fi
+    next_cursor=$(jq -r '.paging.since // 0' <<<"$page")
+    [[ $next_cursor =~ ^[0-9]+$ ]] || { rm -f "$collected_file"; return 1; }
+    (( next_cursor > 0 && next_cursor != cursor )) || break
+    cursor=$next_cursor
+    ((page_count += 1))
+  done
+
+  (( page_count < backlog_max_pages )) || {
+    rm -f "$collected_file"
+    printf 'Gotify backlog exceeds the safe pagination limit\n' >&2
+    return 1
+  }
+  jq -sc --argjson last "$last_id" \
+    '{messages:(map(select(.id > $last)) | unique_by(.id) | sort_by(.id))}' "$collected_file"
+  rm -f "$collected_file"
 }
 
 api_applications() {
@@ -41,14 +114,34 @@ api_applications() {
 }
 
 write_state() {
-  local last_id=$1 online=$2 error=${3:-} unread=${4:-0}
-  local tmp
+  local last_id=$1 online=$2 error=${3:-} unread=${4:-0} locked=${5:-false}
+  local tmp now last_success=""
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [[ -s $state_file ]]; then
+    last_success=$(jq -r '.lastSuccessAt // .checkedAt // ""' "$state_file" 2>/dev/null || true)
+  fi
+  [[ $online == true ]] && last_success=$now
   tmp=$(mktemp "$state_dir/.state.XXXXXX")
   jq -n --argjson lastId "$last_id" --argjson online "$online" --argjson unread "$unread" \
-    --arg checkedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg error "$error" \
-    '{lastId:$lastId,online:$online,unread:$unread,checkedAt:$checkedAt,error:$error}' >"$tmp"
+    --argjson locked "$locked" \
+    --arg checkedAt "$now" --arg lastSuccessAt "$last_success" --arg error "$error" \
+    '{lastId:$lastId,online:$online,unread:$unread,checkedAt:$checkedAt,
+      lastSuccessAt:$lastSuccessAt,error:$error,locked:$locked}' >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$state_file"
+}
+
+session_locked() {
+  if [[ -n ${GOTIFY_LOCK_STATE:-} ]]; then
+    [[ $GOTIFY_LOCK_STATE == true ]]
+    return
+  fi
+  command -v omarchy-shell >/dev/null 2>&1 || return 1
+  [[ $(omarchy-shell lock isLocked 2>/dev/null || printf false) == true ]]
+}
+
+log_event() {
+  logger -t omarchy-gotify -- "$*" 2>/dev/null || true
 }
 
 application_icon() {
@@ -91,44 +184,106 @@ notify_message() {
   fi
 }
 
+notify_catch_up() {
+  local items=$1 applications=$2 count summary
+  count=$(jq 'length' <<<"$items")
+  summary=$(jq -r --argjson apps "$applications" '
+    ($apps | map({key:(.id|tostring), value:(.name // ("App " + (.id|tostring)))}) | from_entries) as $names |
+    group_by(.appid) | map({name:($names[(.[0].appid|tostring)] // ("App " + (.[0].appid|tostring))), count:length}) |
+    sort_by(-.count, .name) | .[:3] |
+    map(.name + " (" + (.count|tostring) + ")") | join(", ")' <<<"$items")
+  [[ -n $summary ]] || summary="Open Gotify to review them."
+  omarchy-notification-send --app-name Gotify -i "$plugin_dir/assets/gotify-banner.png" -u normal \
+    "$count Gotify messages received while away" "$summary" --exec xdg-open "$server"
+}
+
 poll() {
   read_config || exit 0
   exec 9>"$lock_file"
   flock -n 9 || exit 0
 
   local last_id=0 unread=0 payload applications error max_id new_count initialized=false
+  local last_success_at="" last_success_epoch=0 now_epoch gap_seconds=0 catch_up=false new_items critical_items
+  local was_locked=false currently_locked=false
   if [[ -s $state_file ]]; then
     last_id=$(jq -r '.lastId // 0' "$state_file" 2>/dev/null || echo 0)
     unread=$(jq -r '.unread // 0' "$state_file" 2>/dev/null || echo 0)
+    last_success_at=$(jq -r '.lastSuccessAt // .checkedAt // ""' "$state_file" 2>/dev/null || true)
+    was_locked=$(jq -r '.locked // false' "$state_file" 2>/dev/null || echo false)
   else
     initialized=true
   fi
 
-  # Gotify's `since` value is a backward-pagination cursor (IDs below it),
-  # not a lower bound. Fetch the newest page and filter IDs locally.
-  if ! payload=$(api_messages 0 2>&1); then
+  if [[ $initialized == true ]]; then
+    if ! payload=$(api_messages 0 2>&1); then
+      error=$(tail -n 1 <<<"$payload")
+      write_state 0 false "$error" 0 false
+      log_event "poll failed during initialization"
+      exit 0
+    fi
+    max_id=$(jq '[.messages[]?.id // 0] | max // 0' <<<"$payload")
+    write_state "$max_id" true "" 0 false
+    log_event "initialized at message $max_id"
+    exit 0
+  fi
+
+  if ! payload=$(api_messages_since "$last_id" 2>&1); then
     error=$(tail -n 1 <<<"$payload")
-    write_state "$last_id" false "$error" "$unread"
+    write_state "$last_id" false "$error" "$unread" "$was_locked"
+    log_event "poll failed; retaining message $last_id"
     exit 0
   fi
 
   max_id=$(jq '[.messages[]?.id // 0] | max // 0' <<<"$payload")
-  if [[ $initialized == true ]]; then
-    write_state "$max_id" true "" 0
+
+  session_locked && currently_locked=true
+  if [[ $currently_locked == true ]]; then
+    # Keep lastId and unread unchanged. The same messages remain pending and
+    # will be summarized once the session unlocks, without duplicate counting.
+    write_state "$last_id" true "" "$unread" true
+    if (( max_id > last_id )) && [[ $was_locked != true ]]; then
+      log_event "holding messages while session is locked"
+    fi
     exit 0
   fi
 
-  applications=$(api_applications 2>/dev/null || echo '[]')
-
-  while IFS= read -r item; do
-    [[ -n $item ]] && notify_message "$item" "$applications"
-  done < <(jq -c --argjson last "$last_id" '[.messages[]? | select(.id > $last)] | sort_by(.id)[]' <<<"$payload")
-
-  new_count=$(jq --argjson last "$last_id" '[.messages[]? | select(.id > $last)] | length' <<<"$payload")
+  new_items=$(jq -c --argjson last "$last_id" '[.messages[]? | select(.id > $last)] | sort_by(.id)' <<<"$payload")
+  new_count=$(jq 'length' <<<"$new_items")
   unread=$((unread + new_count))
 
+  if [[ $notifications_enabled == true && $new_count -gt 0 ]]; then
+    applications=$(api_applications 2>/dev/null || echo '[]')
+    now_epoch=$(date +%s)
+    if [[ -n $last_success_at ]]; then
+      last_success_epoch=$(date -d "$last_success_at" +%s 2>/dev/null || echo 0)
+      (( last_success_epoch > 0 && now_epoch > last_success_epoch )) && gap_seconds=$((now_epoch - last_success_epoch))
+    fi
+    if [[ $catch_up_enabled == true ]]; then
+      if [[ $was_locked == true && $new_count -gt 1 ]] || \
+          (( gap_seconds > catch_up_after_seconds &&
+             new_count > max_individual_notifications )); then
+        catch_up=true
+      fi
+    fi
+
+    if [[ $catch_up == true ]]; then
+      critical_items=$(jq -c --argjson limit "$max_critical_catch_up" \
+        '[.[] | select((.priority // 0) >= 8)][: $limit]' <<<"$new_items")
+      while IFS= read -r item; do
+        [[ -n $item ]] && notify_message "$item" "$applications"
+      done < <(jq -c '.[]' <<<"$critical_items")
+      notify_catch_up "$new_items" "$applications"
+      log_event "sent catch-up summary for $new_count messages"
+    else
+      while IFS= read -r item; do
+        [[ -n $item ]] && notify_message "$item" "$applications"
+      done < <(jq -c '.[]' <<<"$new_items")
+      log_event "sent $new_count individual notification(s)"
+    fi
+  fi
+
   (( max_id < last_id )) && max_id=$last_id
-  write_state "$max_id" true "" "$unread"
+  write_state "$max_id" true "" "$unread" false
 }
 
 messages() {
@@ -171,7 +326,9 @@ mark_read() {
     online=$(jq -r '.online // true' "$state_file" 2>/dev/null || echo true)
     error=$(jq -r '.error // ""' "$state_file" 2>/dev/null || true)
   fi
-  write_state "$last_id" "$online" "$error" 0
+  local locked=false
+  locked=$(jq -r '.locked // false' "$state_file" 2>/dev/null || echo false)
+  write_state "$last_id" "$online" "$error" 0 "$locked"
 }
 
 open_message() {
@@ -192,25 +349,40 @@ status() {
     jq -n '{configured:false,online:false,message:"Gotify not configured"}'
     return
   fi
-  local online=false checked="Never" error="" unread=0
+  local online=false checked="Never" error="" unread=0 locked=false
   if [[ -s $state_file ]]; then
     online=$(jq -r '.online // false' "$state_file" 2>/dev/null || echo false)
     checked=$(jq -r '.checkedAt // "Never"' "$state_file" 2>/dev/null || echo Never)
     error=$(jq -r '.error // ""' "$state_file" 2>/dev/null || true)
     unread=$(jq -r '.unread // 0' "$state_file" 2>/dev/null || echo 0)
+    locked=$(jq -r '.locked // false' "$state_file" 2>/dev/null || echo false)
   fi
   if [[ $online == true ]]; then
-    jq -n --arg checked "$checked" --argjson unread "$unread" \
+    jq -n --arg checked "$checked" --argjson unread "$unread" --argjson locked "$locked" \
       --argjson showConnectionIndicator "$show_connection_indicator" \
       --argjson showUnreadIndicator "$show_unread_indicator" \
-      '{configured:true,online:true,unread:$unread,showConnectionIndicator:$showConnectionIndicator,
-        showUnreadIndicator:$showUnreadIndicator,message:("Gotify connected · " + $checked)}'
+      --argjson notificationsEnabled "$notifications_enabled" \
+      --argjson catchUpEnabled "$catch_up_enabled" \
+      --argjson maxIndividualNotifications "$max_individual_notifications" \
+      --argjson messageFetchLimit "$message_fetch_limit" \
+      '{configured:true,online:true,unread:$unread,locked:$locked,showConnectionIndicator:$showConnectionIndicator,
+        showUnreadIndicator:$showUnreadIndicator,notificationsEnabled:$notificationsEnabled,
+        catchUpEnabled:$catchUpEnabled,maxIndividualNotifications:$maxIndividualNotifications,
+        messageFetchLimit:$messageFetchLimit,
+        message:("Gotify connected · " + $checked)}'
   else
-    jq -n --arg error "$error" --argjson unread "$unread" \
+    jq -n --arg error "$error" --argjson unread "$unread" --argjson locked "$locked" \
       --argjson showConnectionIndicator "$show_connection_indicator" \
       --argjson showUnreadIndicator "$show_unread_indicator" \
-      '{configured:true,online:false,unread:$unread,showConnectionIndicator:$showConnectionIndicator,
-        showUnreadIndicator:$showUnreadIndicator,message:(if $error == "" then "Gotify waiting for connection" else "Gotify: " + $error end)}'
+      --argjson notificationsEnabled "$notifications_enabled" \
+      --argjson catchUpEnabled "$catch_up_enabled" \
+      --argjson maxIndividualNotifications "$max_individual_notifications" \
+      --argjson messageFetchLimit "$message_fetch_limit" \
+      '{configured:true,online:false,unread:$unread,locked:$locked,showConnectionIndicator:$showConnectionIndicator,
+        showUnreadIndicator:$showUnreadIndicator,notificationsEnabled:$notificationsEnabled,
+        catchUpEnabled:$catchUpEnabled,maxIndividualNotifications:$maxIndividualNotifications,
+        messageFetchLimit:$messageFetchLimit,
+        message:(if $error == "" then "Gotify waiting for connection" else "Gotify: " + $error end)}'
   fi
 }
 
@@ -235,7 +407,8 @@ setup() {
   jq -e '.messages' >/dev/null <<<"$response" || { printf 'Unexpected response from server.\n'; read -r -p 'Press Enter to close…'; exit 1; }
   tmp=$(mktemp "$config_dir/.config.XXXXXX")
   jq -n --arg server "$server_input" --arg token "$token_input" \
-    '{server:$server,token:$token,showConnectionIndicator:true,showUnreadIndicator:true}' >"$tmp"
+    '{server:$server,token:$token,showConnectionIndicator:true,showUnreadIndicator:true,
+      notificationsEnabled:true,catchUpEnabled:true,maxIndividualNotifications:5,messageFetchLimit:100}' >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$config_file"
   write_state "$(jq '[.messages[]?.id // 0] | max // 0' <<<"$response")" true "" 0
@@ -254,16 +427,24 @@ show_config() {
     jq -n --arg server "$server" \
       --argjson showConnectionIndicator "$show_connection_indicator" \
       --argjson showUnreadIndicator "$show_unread_indicator" \
+      --argjson notificationsEnabled "$notifications_enabled" \
+      --argjson catchUpEnabled "$catch_up_enabled" \
+      --argjson maxIndividualNotifications "$max_individual_notifications" \
+      --argjson messageFetchLimit "$message_fetch_limit" \
       '{configured:true,server:$server,hasToken:true,showConnectionIndicator:$showConnectionIndicator,
-        showUnreadIndicator:$showUnreadIndicator}'
+        showUnreadIndicator:$showUnreadIndicator,notificationsEnabled:$notificationsEnabled,
+        catchUpEnabled:$catchUpEnabled,maxIndividualNotifications:$maxIndividualNotifications,
+        messageFetchLimit:$messageFetchLimit}'
   else
-    jq -n '{configured:false,server:"",hasToken:false,showConnectionIndicator:true,showUnreadIndicator:true}'
+    jq -n '{configured:false,server:"",hasToken:false,showConnectionIndicator:true,showUnreadIndicator:true,
+      notificationsEnabled:true,catchUpEnabled:true,maxIndividualNotifications:5,messageFetchLimit:100}'
   fi
 }
 
 configure() {
   local input server_input token_input existing_token="" response tmp
-  local existing_connection=true existing_unread=true connection_input unread_input
+  local existing_connection=true existing_unread=true existing_notifications=true existing_catch_up=true existing_max=5 existing_fetch=100
+  local connection_input unread_input notifications_input catch_up_input max_input fetch_input
   IFS= read -r input || input=""
   if ! server_input=$(jq -er '.server | select(type == "string" and length > 0)' <<<"$input" 2>/dev/null); then
     jq -n '{ok:false,message:"Enter a Gotify server URL."}'
@@ -279,9 +460,19 @@ configure() {
     existing_token=$(jq -r '.token // ""' "$config_file" 2>/dev/null || true)
     existing_connection=$(jq -r 'if has("showConnectionIndicator") then .showConnectionIndicator else true end' "$config_file" 2>/dev/null || echo true)
     existing_unread=$(jq -r 'if has("showUnreadIndicator") then .showUnreadIndicator else true end' "$config_file" 2>/dev/null || echo true)
+    existing_notifications=$(jq -r 'if has("notificationsEnabled") then .notificationsEnabled else true end' "$config_file" 2>/dev/null || echo true)
+    existing_catch_up=$(jq -r 'if has("catchUpEnabled") then .catchUpEnabled else true end' "$config_file" 2>/dev/null || echo true)
+    existing_max=$(jq -r '.maxIndividualNotifications // 5' "$config_file" 2>/dev/null || echo 5)
+    existing_fetch=$(jq -r '.messageFetchLimit // 100' "$config_file" 2>/dev/null || echo 100)
   fi
   connection_input=$(jq -r --argjson fallback "$existing_connection" 'if has("showConnectionIndicator") then .showConnectionIndicator else $fallback end' <<<"$input")
   unread_input=$(jq -r --argjson fallback "$existing_unread" 'if has("showUnreadIndicator") then .showUnreadIndicator else $fallback end' <<<"$input")
+  notifications_input=$(jq -r --argjson fallback "$existing_notifications" 'if has("notificationsEnabled") then .notificationsEnabled else $fallback end' <<<"$input")
+  catch_up_input=$(jq -r --argjson fallback "$existing_catch_up" 'if has("catchUpEnabled") then .catchUpEnabled else $fallback end' <<<"$input")
+  max_input=$(jq -r --argjson fallback "$existing_max" 'if has("maxIndividualNotifications") then .maxIndividualNotifications else $fallback end' <<<"$input")
+  [[ $max_input =~ ^[0-9]+$ ]] && (( max_input >= 1 && max_input <= 20 )) || max_input=5
+  fetch_input=$(jq -r --argjson fallback "$existing_fetch" 'if has("messageFetchLimit") then .messageFetchLimit else $fallback end' <<<"$input")
+  case $fetch_input in 25|50|100|200|500) ;; *) fetch_input=100 ;; esac
   [[ -n $token_input ]] || token_input=$existing_token
   if [[ -z $token_input ]]; then
     jq -n '{ok:false,message:"Enter a Gotify client token."}'
@@ -304,8 +495,13 @@ configure() {
   tmp=$(mktemp "$config_dir/.config.XXXXXX")
   jq -n --arg server "$server_input" --arg token "$token_input" \
     --argjson showConnectionIndicator "$connection_input" --argjson showUnreadIndicator "$unread_input" \
+    --argjson notificationsEnabled "$notifications_input" --argjson catchUpEnabled "$catch_up_input" \
+    --argjson maxIndividualNotifications "$max_input" \
+    --argjson messageFetchLimit "$fetch_input" \
     '{server:$server,token:$token,showConnectionIndicator:$showConnectionIndicator,
-      showUnreadIndicator:$showUnreadIndicator}' >"$tmp"
+      showUnreadIndicator:$showUnreadIndicator,notificationsEnabled:$notificationsEnabled,
+      catchUpEnabled:$catchUpEnabled,maxIndividualNotifications:$maxIndividualNotifications,
+      messageFetchLimit:$messageFetchLimit}' >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$config_file"
   local newest
@@ -315,7 +511,7 @@ configure() {
 }
 
 save_preferences() {
-  local input connection_input unread_input tmp
+  local input connection_input unread_input notifications_input catch_up_input max_input fetch_input tmp
   read_config || {
     jq -n '{ok:false,message:"Configure Gotify before changing preferences."}'
     return 1
@@ -331,14 +527,42 @@ save_preferences() {
     jq -n '{ok:false,message:"Invalid unread-indicator setting."}'
     return 1
   }
+  notifications_input=$(jq -er 'if (.notificationsEnabled | type) == "boolean" then
+      (.notificationsEnabled | tostring) else error("invalid") end' <<<"$input" 2>/dev/null) || {
+    jq -n '{ok:false,message:"Invalid notification setting."}'
+    return 1
+  }
+  catch_up_input=$(jq -er 'if (.catchUpEnabled | type) == "boolean" then
+      (.catchUpEnabled | tostring) else error("invalid") end' <<<"$input" 2>/dev/null) || {
+    jq -n '{ok:false,message:"Invalid catch-up setting."}'
+    return 1
+  }
+  max_input=$(jq -er 'if (.maxIndividualNotifications | type) == "number"
+      and (.maxIndividualNotifications | floor) == .maxIndividualNotifications
+      and .maxIndividualNotifications >= 1 and .maxIndividualNotifications <= 20
+      then (.maxIndividualNotifications | tostring) else error("invalid") end' <<<"$input" 2>/dev/null) || {
+    jq -n '{ok:false,message:"Maximum individual notifications must be between 1 and 20."}'
+    return 1
+  }
+  fetch_input=$(jq -er '.messageFetchLimit as $limit |
+      if ($limit | type) == "number" and ([25,50,100,200,500] | index($limit)) != null
+      then ($limit | tostring) else error("invalid") end' <<<"$input" 2>/dev/null) || {
+    jq -n '{ok:false,message:"Invalid message fetch limit."}'
+    return 1
+  }
   tmp=$(mktemp "$config_dir/.config.XXXXXX")
   jq -n --arg server "$server" --arg token "$token" \
     --argjson showConnectionIndicator "$connection_input" --argjson showUnreadIndicator "$unread_input" \
+    --argjson notificationsEnabled "$notifications_input" --argjson catchUpEnabled "$catch_up_input" \
+    --argjson maxIndividualNotifications "$max_input" \
+    --argjson messageFetchLimit "$fetch_input" \
     '{server:$server,token:$token,showConnectionIndicator:$showConnectionIndicator,
-      showUnreadIndicator:$showUnreadIndicator}' >"$tmp"
+      showUnreadIndicator:$showUnreadIndicator,notificationsEnabled:$notificationsEnabled,
+      catchUpEnabled:$catchUpEnabled,maxIndividualNotifications:$maxIndividualNotifications,
+      messageFetchLimit:$messageFetchLimit}' >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$config_file"
-  jq -n '{ok:true,message:"Indicator preferences saved."}'
+  jq -n '{ok:true,message:"Notification preferences saved."}'
 }
 
 case ${1:-status} in

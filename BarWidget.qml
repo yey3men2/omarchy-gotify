@@ -23,12 +23,23 @@ Panel {
   property string settingsNotice: ""
   property bool showConnectionIndicator: true
   property bool showUnreadIndicator: true
+  property bool notificationsEnabled: true
+  property bool catchUpEnabled: true
+  property int maxIndividualNotifications: 5
+  property int messageFetchLimit: 100
   property int selectedAppId: 0
   property var allApplications: []
   property double nowMs: Date.now()
   readonly property var applications: allApplications.length > 0 ? allApplications : buildApplications(messages)
   readonly property var appFilterOptions: buildFilterOptions(applications)
   readonly property var visibleMessages: filterMessages(messages, selectedAppId)
+  readonly property var fetchLimitOptions: [
+    {value: "25", label: "25 messages", description: "Small recent history"},
+    {value: "50", label: "50 messages", description: "Moderate recent history"},
+    {value: "100", label: "100 messages", description: "Recommended"},
+    {value: "200", label: "200 messages", description: "Extended history"},
+    {value: "500", label: "500 messages", description: "Largest history and catch-up window"}
+  ]
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -145,7 +156,11 @@ Panel {
       server: serverValue,
       token: tokenField.text,
       showConnectionIndicator: showConnectionToggle.checked,
-      showUnreadIndicator: showUnreadToggle.checked
+      showUnreadIndicator: showUnreadToggle.checked,
+      notificationsEnabled: notificationsToggle.checked,
+      catchUpEnabled: catchUpToggle.checked,
+      maxIndividualNotifications: Number(maxNotificationsField.text),
+      messageFetchLimit: Number(fetchLimitDropdown.value)
     })
     saveProcess.running = true
   }
@@ -153,7 +168,11 @@ Panel {
   function saveIndicatorPreferences() {
     preferenceProcess.payload = JSON.stringify({
       showConnectionIndicator: showConnectionToggle.checked,
-      showUnreadIndicator: showUnreadToggle.checked
+      showUnreadIndicator: showUnreadToggle.checked,
+      notificationsEnabled: notificationsToggle.checked,
+      catchUpEnabled: catchUpToggle.checked,
+      maxIndividualNotifications: Number(maxNotificationsField.text),
+      messageFetchLimit: Number(fetchLimitDropdown.value)
     })
     if (preferenceProcess.running) preferenceRetry.restart()
     else preferenceProcess.running = true
@@ -195,6 +214,10 @@ Panel {
           root.unread = Number(state.unread || 0)
           root.showConnectionIndicator = state.showConnectionIndicator !== false
           root.showUnreadIndicator = state.showUnreadIndicator !== false
+          root.notificationsEnabled = state.notificationsEnabled !== false
+          root.catchUpEnabled = state.catchUpEnabled !== false
+          root.maxIndividualNotifications = Number(state.maxIndividualNotifications || 5)
+          root.messageFetchLimit = Number(state.messageFetchLimit || 100)
           root.statusText = String(state.message || "Gotify")
         } catch (e) {
           root.online = false
@@ -259,6 +282,10 @@ Panel {
           tokenField.text = ""
           showConnectionToggle.checked = config.showConnectionIndicator !== false
           showUnreadToggle.checked = config.showUnreadIndicator !== false
+          notificationsToggle.checked = config.notificationsEnabled !== false
+          catchUpToggle.checked = config.catchUpEnabled !== false
+          maxNotificationsField.text = String(config.maxIndividualNotifications || 5)
+          fetchLimitDropdown.value = String(config.messageFetchLimit || 100)
         } catch (e) {
           root.settingsNotice = "Could not load the current configuration."
         }
@@ -285,6 +312,10 @@ Panel {
           serverField.text = String(result.server || serverField.text)
           root.showConnectionIndicator = showConnectionToggle.checked
           root.showUnreadIndicator = showUnreadToggle.checked
+          root.notificationsEnabled = notificationsToggle.checked
+          root.catchUpEnabled = catchUpToggle.checked
+          root.maxIndividualNotifications = Number(maxNotificationsField.text)
+          root.messageFetchLimit = Number(fetchLimitDropdown.value)
           root.refreshStatus()
           root.refreshMessages()
         }
@@ -514,6 +545,85 @@ Panel {
               checked = !checked
               root.showUnreadIndicator = checked
               root.saveIndicatorPreferences()
+            }
+          }
+
+          PanelSectionHeader {
+            text: "NOTIFICATIONS"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          }
+
+          Toggle {
+            id: notificationsToggle
+            width: parent.width
+            label: "Desktop notifications"
+            description: "Show Gotify messages as desktop notifications. History and unread counts continue when disabled."
+            checked: true
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            accent: Color.accent
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            onClicked: {
+              checked = !checked
+              root.notificationsEnabled = checked
+              root.saveIndicatorPreferences()
+            }
+          }
+
+          Toggle {
+            id: catchUpToggle
+            width: parent.width
+            label: "Summarize messages received while away"
+            description: "After sleep or a long connection gap, show one summary instead of replaying every message."
+            checked: true
+            enabled: notificationsToggle.checked
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            accent: Color.accent
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            onClicked: {
+              checked = !checked
+              root.catchUpEnabled = checked
+              root.saveIndicatorPreferences()
+            }
+          }
+
+          Text {
+            width: parent.width
+            text: "Maximum notifications after a connection gap (1–20)"
+            color: root.bar ? root.bar.foreground : Color.foreground
+            opacity: notificationsToggle.checked && catchUpToggle.checked ? 1.0 : 0.5
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+          TextField {
+            id: maxNotificationsField
+            width: parent.width
+            text: "5"
+            enabled: notificationsToggle.checked && catchUpToggle.checked
+            inputMethodHints: Qt.ImhDigitsOnly
+            validator: IntValidator { bottom: 1; top: 20 }
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            onEditingFinished: {
+              if (acceptableInput) {
+                root.maxIndividualNotifications = Number(text)
+                root.saveIndicatorPreferences()
+              }
+            }
+          }
+
+          SearchableDropdown {
+            id: fetchLimitDropdown
+            width: parent.width
+            label: "Messages to fetch"
+            value: "100"
+            options: root.fetchLimitOptions
+            placeholderText: "Select history size…"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            onChanged: function(value) {
+              root.messageFetchLimit = Number(value)
+              root.saveIndicatorPreferences()
+              root.refreshMessages()
             }
           }
 

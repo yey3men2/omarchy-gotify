@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "yey3men2.gotify",
   "name": "Gotify",
-  "version": "1.0.1",
+  "version": "1.2.0",
   "author": "Gerson De La Cruz",
   "license": "MIT",
   "description": "Receive Gotify messages and browse notification history from the Omarchy bar.",
